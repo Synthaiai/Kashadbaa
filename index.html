@@ -2633,42 +2633,157 @@
 
     const DB_PATH = 'kass_menu';
 
+    /* ═══════════════════════════════════════════════════════════
+       تحميل المنيو — مفصول عن الصور
+       ───────────────────────────────────────────────────────────
+       الصور تُخزَّن في مسار مستقل (kass_menu/images/<id>) ولا تُحمَّل
+       مع بيانات المنيو. هكذا يبقى طلب المنيو بضعة كيلوبايتات فقط
+       فتصل الأسعار والأصناف فوراً حتى على نت الرصيد (زين/آسياسيل)،
+       والصور تنزل لاحقاً واحدة واحدة عند ظهورها على الشاشة.
+       ═══════════════════════════════════════════════════════════ */
+
+    // أولوية مصدر البيانات: 0 = محلي مبدئي، 1 = طلب REST، 2 = تحديث لحظي.
+    // تمنع نتيجة قديمة متأخرة من الكتابة فوق بيانات أحدث.
+    let DATA_RANK = -1;
+
+    const IMG_CACHE   = new Map();  // id -> dataURL أو null (لا توجد صورة)
+    const IMG_PENDING = new Map();  // id -> Promise قيد التنفيذ
+    let   imgObserver = null;
+
+    function dbUrl(path) {
+      return firebaseConfig.databaseURL + '/' + DB_PATH + '/' + path + '.json';
+    }
+
+    // طلب JSON مع مهلة زمنية — لا يعلّق الصفحة على الشبكات البطيئة.
+    function fetchJson(url, ms) {
+      const ctl = ('AbortController' in window) ? new AbortController() : null;
+      const timer = ctl ? setTimeout(() => ctl.abort(), ms || 20000) : null;
+      return fetch(url + (url.indexOf('?') === -1 ? '?' : '&') + 't=' + Date.now(),
+                   { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null)
+        .then(v => { if (timer) clearTimeout(timer); return v; });
+    }
+
+    // يجلب صورة صنف واحد عند الحاجة فقط، ويحفظها في الذاكرة.
+    function getItemImage(id) {
+      const key = String(id);
+      if (IMG_CACHE.has(key))   return Promise.resolve(IMG_CACHE.get(key));
+      if (IMG_PENDING.has(key)) return IMG_PENDING.get(key);
+      if (typeof firebaseConfig === 'undefined' || !firebaseConfig.databaseURL) {
+        return Promise.resolve(null);
+      }
+      const p = fetchJson(dbUrl('images/' + encodeURIComponent(key)), 30000)
+        .then(v => {
+          const url = (typeof v === 'string' && v.trim() !== '') ? v : null;
+          IMG_PENDING.delete(key);
+          if (url) IMG_CACHE.set(key, url);   // لا نخزّن الفشل حتى نعيد المحاولة لاحقاً
+          return url;
+        });
+      IMG_PENDING.set(key, p);
+      return p;
+    }
+
+    function itemHasImage(it) {
+      if (!it) return false;
+      if (it.hasImg) return true;
+      if (it.img && String(it.img).trim() !== '') return true;
+      return !!IMG_CACHE.get(String(it.id));
+    }
+
+    // يملأ صندوق صورة ببطاقة الصنف بعد تنزيلها.
+    function fillImageBox(box) {
+      const id = box.getAttribute('data-img-id');
+      if (!id || box.hasAttribute('data-img-done')) return;
+      box.setAttribute('data-img-done', '1');
+      getItemImage(id).then(url => {
+        if (!url) { box.removeAttribute('data-img-done'); return; }
+        const im = new Image();
+        im.className = 'ic-img';
+        im.alt = box.getAttribute('data-img-alt') || '';
+        im.decoding = 'async';
+        im.onload = () => { box.innerHTML = ''; box.appendChild(im); };
+        im.onerror = () => box.removeAttribute('data-img-done');
+        im.src = url;
+      });
+    }
+
+    // يراقب البطاقات ويحمّل صورها عند اقترابها من الشاشة.
+    function initImgLazy() {
+      const boxes = document.querySelectorAll('[data-img-id]:not([data-img-done])');
+      if (!('IntersectionObserver' in window)) {
+        boxes.forEach(fillImageBox);
+        return;
+      }
+      if (!imgObserver) {
+        imgObserver = new IntersectionObserver(entries => {
+          entries.forEach(en => {
+            if (!en.isIntersecting) return;
+            imgObserver.unobserve(en.target);
+            fillImageBox(en.target);
+          });
+        }, { rootMargin: '300px' });
+      }
+      boxes.forEach(b => imgObserver.observe(b));
+    }
+
+    // يجلب المنيو (بدون صور) — بضعة كيلوبايتات فقط.
+    let lastRefresh = 0;
+    function refreshMenu() {
+      if (typeof firebaseConfig === 'undefined' || !firebaseConfig.databaseURL) return;
+      const now = Date.now();
+      if (now - lastRefresh < 5000) return;   // تفادي الطلبات المتكررة
+      lastRefresh = now;
+      Promise.all([
+        fetchJson(dbUrl('categories'), 20000),
+        fetchJson(dbUrl('items'), 20000)
+      ]).then(([categories, items]) => {
+        // الأصناف وحدها هي الشرط — أقسام بلا أصناف تعني طلباً ناقصاً
+        if (items) loadFromData({ categories, items }, 1);
+      });
+    }
+
     function initFirebase() {
-      // 1. INSTANT LOAD: Load local data immediately for zero-wait experience
+      // 1. عرض فوري من البيانات المحلية حتى لا تكون الشاشة فارغة.
       if (typeof initialData !== 'undefined') {
-        loadFromData(initialData);
+        loadFromData(initialData, 0);
       }
 
-      // 1.5 REST FETCH (robust): طلب HTTPS بسيط يجيب آخر منيو من السحابة.
-      //     يشتغل حتى على نت الرصيد (زين/آسيا) حيث يُخنق اتصال Firebase المباشر.
-      if (typeof firebaseConfig !== 'undefined' && firebaseConfig.databaseURL) {
-        fetch(firebaseConfig.databaseURL + '/' + DB_PATH + '.json?t=' + Date.now(), { cache: 'no-store' })
-          .then(r => r.ok ? r.json() : null)
-          .then(data => { if (data) loadFromData(data); })
-          .catch(() => {});
-      }
+      // 2. المصدر الأساسي: طلب REST خفيف للأقسام والأصناف فقط.
+      refreshMenu();
 
-      // 2. CLOUD SYNC: Connect to Firebase in the background (realtime updates)
+      // 3. التحديث اللحظي — على مسارَي الأقسام والأصناف فقط، لا على الجذر،
+      //    حتى لا يسحب مجلد الصور بالكامل مع كل تحديث.
       if (typeof firebase === 'undefined' || typeof firebaseConfig === 'undefined' || firebaseConfig.apiKey === "YOUR_API_KEY") {
         return;
       }
 
-      const dbRef = firebase.database().ref(DB_PATH);
-      
-      // Use 'once' first for a fast single fetch to save data/bandwidth
-      dbRef.once('value').then(snap => {
-        const data = snap.val();
-        if (data) loadFromData(data);
-      }).catch(err => console.log('Firebase offline, using local data.'));
+      const root = firebase.database().ref(DB_PATH);
+      let liveCats = null, liveItems = null;
+      const applyLive = () => {
+        // المستمعان منفصلان — لا نعرض شيئاً قبل وصول الأصناف، وإلا اعتُبرت
+        // البيانات فارغة فرجع الموقع إلى القائمة المحلية القديمة لحظياً.
+        if (!liveItems) return;
+        loadFromData({ categories: liveCats, items: liveItems }, 2);
+      };
+      const onErr = () => console.log('Firebase realtime unavailable, using REST data.');
 
-      // Then listen for changes silently
-      dbRef.on('value', snap => {
-        const data = snap.val();
-        if (data) loadFromData(data);
-      });
+      root.child('categories').on('value', s => { liveCats = s.val(); applyLive(); }, onErr);
+      root.child('items').on('value',      s => { liveItems = s.val(); applyLive(); }, onErr);
     }
 
-    function loadFromData(data) {
+    // إعادة المحاولة عند رجوع الشبكة أو عند العودة إلى الصفحة —
+    // مهم على نت الرصيد حيث ينقطع الاتصال ويرجع كثيراً.
+    window.addEventListener('online', refreshMenu);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) refreshMenu();
+    });
+
+    function loadFromData(data, rank) {
+      if (typeof rank !== 'number') rank = 2;
+      if (rank < DATA_RANK) return;   // لا تكتب بيانات أقدم فوق أحدث
+      DATA_RANK = rank;
+
       // Robustness check: if data is empty or missing items, try to fallback to initialData
       let finalData = data;
       const hasItems = data && data.items && (Array.isArray(data.items) ? data.items.length > 0 : Object.keys(data.items).length > 0);
@@ -2681,7 +2796,8 @@
       // Load Categories
       if (finalData.categories) {
         CATS = Array.isArray(finalData.categories) ? finalData.categories : Object.values(finalData.categories);
-      } else if (typeof initialData !== 'undefined' && initialData.categories) {
+      } else if (CATS.length === 0 && typeof initialData !== 'undefined' && initialData.categories) {
+        // لا نستبدل أقساماً وصلت من السحابة بالأقسام المحلية القديمة
         CATS = initialData.categories;
       }
 
@@ -2700,7 +2816,10 @@
 
       const items = finalData.items ? (Array.isArray(finalData.items) ? finalData.items : Object.values(finalData.items)) : [];
       items.forEach(it => {
-        if (it && DB[it.cat]) DB[it.cat].push(it);
+        if (!it) return;
+        // توافق مع البيانات القديمة: صنف ما زالت صورته مخزّنة بداخله.
+        if (it.img && String(it.img).trim() !== '') IMG_CACHE.set(String(it.id), it.img);
+        if (DB[it.cat]) DB[it.cat].push(it);
       });
 
       renderLiveUI();
@@ -2765,10 +2884,18 @@
       return '';
     }
 
+    // تهريب النصوص الموضوعة داخل خصائص HTML
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
     /* ── RENDER CARD ── */
     function rCard(item, delay = 0) {
       const isUnavailable = item.badge === 'unavailable';
-      const hasImage = item.img && item.img.trim() !== '';
+      const hasImage = itemHasImage(item);
+      const cached = IMG_CACHE.get(String(item.id));
       return `<div class="ic ${isUnavailable ? 'unavailable' : ''}" style="transition-delay:${delay}s" onclick="${isUnavailable ? 'event.stopPropagation()' : `openModal('${item.id}')`}">
         <div class="ic-body">
           <div style="display:flex; align-items:center; gap:8px;">
@@ -2779,9 +2906,9 @@
           <span class="ic-price" style="font-size:14.5px; font-weight:700; color:var(--red);">${item.price.toLocaleString()} د.ع</span>
         </div>
         <div class="ic-img-wrap">
-          <div class="ic-img-box">
-            ${hasImage
-              ? `<img src="${item.img}" class="ic-img" alt="${item.name}" loading="lazy" onerror="this.style.display='none';this.insertAdjacentHTML('afterend','<div class=\\'ic-img-placeholder\\'><i class=\\'ph-fill ph-fork-knife\\'></i></div>');">`
+          <div class="ic-img-box"${hasImage ? ` data-img-id="${item.id}" data-img-alt="${esc(item.name)}"${cached ? ' data-img-done="1"' : ''}` : ''}>
+            ${cached
+              ? `<img src="${cached}" class="ic-img" alt="${esc(item.name)}" loading="lazy">`
               : `<div class="ic-img-placeholder"><i class="ph-fill ph-fork-knife"></i></div>`
             }
           </div>
@@ -2848,6 +2975,8 @@
         const i = Math.round(this.scrollLeft / 200);
         document.querySelectorAll('.dot').forEach((d, j) => d.classList.toggle('on', j === i));
       });
+
+      initImgLazy();
     }
 
     function scrollFeat(i) {
@@ -2930,6 +3059,7 @@
         : '<p style="color:var(--sub);font-size:14.5px;grid-column:1/-1;padding:40px 0;text-align:center;font-weight:600;">لا توجد نتائج مطابقة 💔</p>';
 
       goTab('home', document.querySelector('.tb'));
+      initImgLazy();
       setTimeout(initReveal, 50);
     }
 
@@ -2940,12 +3070,23 @@
       modalItem = item;
 
       const imgW = document.getElementById('mImgW');
-      if (item.img && item.img.trim() !== '') {
-        imgW.innerHTML = `<div class="m-img-wrap"><img src="${item.img}" class="m-img" alt="${item.name}" onerror="this.parentElement.parentElement.innerHTML='<div class=\\'m-ph\\'><i class=\\'ph-fill ph-fork-knife\\'></i></div>';"></div>`;
-        imgW.style.display = 'block';
-      } else {
-        imgW.innerHTML = `<div class="m-ph"><i class="ph-fill ph-fork-knife"></i></div>`;
-        imgW.style.display = 'block';
+      imgW.style.display = 'block';
+      imgW.innerHTML = `<div class="m-ph"><i class="ph-fill ph-fork-knife"></i></div>`;
+      if (itemHasImage(item)) {
+        getItemImage(item.id).then(url => {
+          // تجاهل النتيجة إن كان الزبون قد فتح صنفاً آخر أثناء التنزيل
+          if (!url || modalItem !== item) return;
+          const im = new Image();
+          im.className = 'm-img';
+          im.alt = item.name;
+          im.decoding = 'async';
+          im.onload = () => {
+            if (modalItem !== item) return;
+            imgW.innerHTML = '<div class="m-img-wrap"></div>';
+            imgW.firstElementChild.appendChild(im);
+          };
+          im.src = url;
+        });
       }
       document.getElementById('mName').textContent = item.name;
       document.getElementById('mPrice').textContent = item.price.toLocaleString() + ' د.ع';

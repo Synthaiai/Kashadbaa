@@ -645,21 +645,104 @@
                 });
             });
 
-            // Listen to data
-            db.on('value', snap => {
-                const data = snap.val();
+            // Listen to items only — لا نستمع على الجذر حتى لا نسحب مجلد الصور كاملاً
+            db.child('items').on('value', snap => {
+                const items = snap.val();
                 document.getElementById('statusDot').className = 'dot online';
                 document.getElementById('statusTxt').innerText = "متصل مباشر بالسحابة";
-                
-                if(!data || !data.items) {
+
+                if(!items) {
                     showEmptyState();
                 } else {
-                    renderDashboard(data);
+                    renderDashboard({ items });
+                    migrateInlineImages(items);
                 }
             }, err => {
                 console.error(err);
                 document.getElementById('statusTxt').innerText = "خطأ في الصلاحيات!";
             });
+        }
+
+        /* ═══════════════════════════════════════════════════════════
+           فصل الصور عن بيانات المنيو
+           ───────────────────────────────────────────────────────────
+           الصور تُخزَّن في kass_menu/images/<id> بدل أن تكون داخل الصنف.
+           السبب: مجموع الصور كان يتجاوز 1.2 ميغابايت، فيُحمَّل كاملاً مع
+           كل فتح للموقع. على نت الرصيد (زين/آسياسيل) لا يكتمل التنزيل،
+           فيبقى الزبون يرى القائمة القديمة. بعد الفصل صار طلب المنيو
+           بضعة كيلوبايتات، والصور تنزل كل واحدة على حدة عند الحاجة.
+           ═══════════════════════════════════════════════════════════ */
+
+        const ADMIN_IMG_CACHE = new Map();
+
+        // يجلب صورة صنف واحد عند الحاجة فقط
+        function getItemImage(id) {
+            const key = String(id);
+            if (ADMIN_IMG_CACHE.has(key)) return Promise.resolve(ADMIN_IMG_CACHE.get(key));
+            return db.child('images').child(key).get()
+                .then(s => {
+                    const v = s.val();
+                    const url = (typeof v === 'string' && v.trim() !== '') ? v : '';
+                    ADMIN_IMG_CACHE.set(key, url);
+                    return url;
+                })
+                .catch(() => '');
+        }
+
+        // نقل الصور القديمة المخزّنة داخل الأصناف إلى المسار الجديد — يُنفَّذ مرة واحدة
+        let migrationRan = false;
+        function migrateInlineImages(itemsObj) {
+            if (migrationRan) return;
+            const legacy = Object.values(itemsObj || {})
+                .filter(it => it && typeof it.img === 'string' && it.img.indexOf('data:') === 0);
+            if (legacy.length === 0) return;
+
+            migrationRan = true;
+            const status = document.getElementById('statusTxt');
+            status.innerText = `جاري نقل ${legacy.length} صورة إلى التخزين المنفصل...`;
+
+            const updates = {};
+            legacy.forEach(it => {
+                const key = String(it.id);
+                updates['images/' + key]     = it.img;
+                updates['items/' + key + '/img']    = '';
+                updates['items/' + key + '/hasImg'] = true;
+                ADMIN_IMG_CACHE.set(key, it.img);
+            });
+
+            db.update(updates).then(() => {
+                status.innerText = 'متصل مباشر بالسحابة';
+                showToast(`تم تسريع الموقع: نُقلت ${legacy.length} صورة ✅`);
+            }).catch(err => {
+                console.error(err);
+                migrationRan = false;
+                status.innerText = 'تعذّر نقل الصور — أعد المحاولة';
+            });
+        }
+
+        // يحمّل صور البطاقات في اللوحة عند ظهورها
+        function initAdminImgLazy() {
+            const boxes = document.querySelectorAll('[data-img-id]:not([data-img-done])');
+            const fill = box => {
+                const id = box.getAttribute('data-img-id');
+                box.setAttribute('data-img-done', '1');
+                getItemImage(id).then(url => {
+                    if (!url) return;
+                    box.innerHTML = `<img style="width:100%; height:100%; object-fit:cover;">`;
+                    box.firstElementChild.src = url;
+                });
+            };
+            if (!('IntersectionObserver' in window)) { boxes.forEach(fill); return; }
+            if (!window._adminImgObs) {
+                window._adminImgObs = new IntersectionObserver(entries => {
+                    entries.forEach(en => {
+                        if (!en.isIntersecting) return;
+                        window._adminImgObs.unobserve(en.target);
+                        fill(en.target);
+                    });
+                }, { rootMargin: '300px' });
+            }
+            boxes.forEach(b => window._adminImgObs.observe(b));
         }
 
         function showEmptyState() {
@@ -699,10 +782,10 @@
                         badgeHtml = `<span style="font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; background:#fef3c7; color:#b45309; border: 1px solid #fde68a; margin-right: 8px;">الأكثر طلباً ⭐</span>`;
                     }
 
-                    const hasImg = it.img && it.img.trim() !== '';
-                    const imgHtml = `<div style="width:56px; height:56px; border-radius:12px; overflow:hidden; background:var(--bg); border:1px solid var(--border); flex-shrink:0; display:flex; align-items:center; justify-content:center;">
-                        ${hasImg ? `<img src="${it.img}" style="width:100%; height:100%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">` : ''}
-                        <i class="ph-bold ph-fork-knife" style="color:var(--sub); font-size:20px; ${hasImg ? 'display:none;' : ''}"></i>
+                    // الصورة تُجلب من مسارها المنفصل عند ظهور البطاقة
+                    const hasImg = it.hasImg === true || (it.img && it.img.trim() !== '');
+                    const imgHtml = `<div style="width:56px; height:56px; border-radius:12px; overflow:hidden; background:var(--bg); border:1px solid var(--border); flex-shrink:0; display:flex; align-items:center; justify-content:center;"${hasImg ? ` data-img-id="${it.id}"` : ''}>
+                        <i class="ph-bold ph-fork-knife" style="color:var(--sub); font-size:20px;"></i>
                     </div>`;
 
                     section += `
@@ -727,6 +810,8 @@
                 section += `</div></div>`;
                 container.innerHTML += section;
             });
+
+            initAdminImgLazy();
         }
 
         function openModal(mode) {
@@ -758,15 +843,34 @@
                     document.getElementById('mealDesc').value = it.desc || '';
                     document.getElementById('mealPrice').value = it.price;
                     document.getElementById('mealBadge').value = it.badge || '';
+
+                    // الصورة محفوظة في مسار منفصل — نجلبها عند فتح التعديل فقط
                     document.getElementById('mealImg').value = it.img || '';
                     refreshPreview();
+                    if (it.hasImg && !(it.img || '').trim()) {
+                        document.getElementById('uploadStatus').style.color = 'var(--sub)';
+                        document.getElementById('uploadStatus').innerText = 'جاري تحميل الصورة الحالية...';
+                        getItemImage(it.id).then(url => {
+                            // تأكد أن المستخدم ما زال يعدّل نفس الصنف ولم يرفع صورة جديدة
+                            if (document.getElementById('mealId').value !== String(it.id)) return;
+                            if (document.getElementById('mealImg').value.trim() !== '') return;
+                            document.getElementById('mealImg').value = url || '';
+                            document.getElementById('uploadStatus').innerText = '';
+                            refreshPreview();
+                        });
+                    }
                 }
             });
         }
 
         function deleteItem(id) {
             if(confirm('هل أنت متأكد من حذف هذه الوجبة نهائياً؟')) {
-                db.child('items').child(id).remove().then(() => {
+                // احذف الصنف وصورته معاً حتى لا تبقى صور يتيمة في قاعدة البيانات
+                const updates = {};
+                updates['items/' + id]  = null;
+                updates['images/' + id] = null;
+                db.update(updates).then(() => {
+                    ADMIN_IMG_CACHE.delete(String(id));
                     alert('تم الحذف بنجاح');
                 });
             }
@@ -775,13 +879,19 @@
         document.getElementById('mealForm').onsubmit = (e) => {
             e.preventDefault();
             const id = document.getElementById('mealId').value || Date.now().toString();
+            const imgVal = (document.getElementById('mealImg').value || '').trim();
+            // الصور الكبيرة (base64) تُخزَّن في مسار منفصل حتى يبقى المنيو خفيفاً.
+            // روابط الصور العادية صغيرة، فتبقى داخل الصنف كما هي.
+            const isEmbedded = imgVal.indexOf('data:') === 0;
+
             const meal = {
                 id: id,
                 cat: document.getElementById('mealCat').value,
                 name: document.getElementById('mealName').value,
                 desc: document.getElementById('mealDesc').value,
                 price: parseInt(document.getElementById('mealPrice').value),
-                img: document.getElementById('mealImg').value || '',
+                img: isEmbedded ? '' : imgVal,
+                hasImg: imgVal !== '',
                 badge: document.getElementById('mealBadge').value || ''
             };
 
@@ -790,11 +900,21 @@
             btn.disabled = true;
             btn.innerHTML = '<i class="ph-bold ph-spinner ph-spin"></i> جاري الحفظ...';
 
-            db.child('items').child(id).set(meal).then(() => {
+            const updates = {};
+            updates['items/' + id]  = meal;
+            updates['images/' + id] = isEmbedded ? imgVal : null;
+
+            db.update(updates).then(() => {
+                ADMIN_IMG_CACHE.set(String(id), isEmbedded ? imgVal : '');
                 btn.disabled = false;
                 btn.innerHTML = originalText;
                 closeModal();
                 showToast('تم حفظ الوجبة وتحديثها لجميع الزبائن ✅');
+            }).catch(err => {
+                console.error(err);
+                btn.disabled = false;
+                btn.innerHTML = originalText;
+                alert('تعذّر الحفظ — تحقّق من الاتصال وأعد المحاولة.');
             });
         };
 
@@ -879,7 +999,7 @@
                 alert('لم يتم العثور على البيانات الأصلية في ملف firebase-config.js');
                 return;
             }
-            if(confirm('⚠️ تحذير: سيتم إعادة ضبط قائمة الطعام إلى الحالة الأصلية. سيتم حذف جميع تعديلاتك الحالية. هل تريد الاستمرار؟')) {
+            if(confirm('⚠️ تحذير: سيتم إعادة ضبط قائمة الطعام إلى الحالة الأصلية. سيتم حذف جميع تعديلاتك الحالية وجميع الصور المرفوعة. هل تريد الاستمرار؟')) {
                 const itemsObj = {};
                 if(initialData.items) {
                     initialData.items.forEach(it => {
